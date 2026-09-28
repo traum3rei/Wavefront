@@ -48,7 +48,7 @@ function deleteObject(id) {
 }
 
 // ---- canvas setup ------------------------------------------------------
-const canvas = document.getElementById("stage");
+const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 
 function resize() {
