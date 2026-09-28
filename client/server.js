@@ -1,11 +1,15 @@
-// Patchbay server — step 3: authoritative room state + naive broadcast.
-// Serves the static client and speaks the message shapes from schema.md.
+// Patchbay server — step 4: authoritative room state + version-based
+// conflict resolution. Serves the static client and speaks the message
+// shapes from schema.md.
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 3000;
+// Set NO_CONFLICT_CHECK=1 to disable conflict resolution, so you can confirm
+// test.js actually FAILS without it:  NO_CONFLICT_CHECK=1 npm start
+const CHECK = process.env.NO_CONFLICT_CHECK !== "1";
 
 // Whitelist, so server.js / package.json are never served.
 const STATIC = {
@@ -15,6 +19,11 @@ const STATIC = {
   "/main.js": ["main.js", "text/javascript"],
   "/style.css": ["style.css", "text/css"],
 };
+
+// Same rule the clients use: higher version wins; equal versions are broken
+// by client id, so everyone picks the same winner without comparing clocks.
+const newer = (a, b) =>
+  a.version > b.version || (a.version === b.version && a.updatedBy > b.updatedBy);
 
 const server = http.createServer((req, res) => {
   const url = req.url.split("?")[0];
@@ -29,11 +38,13 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 
-// roomId -> { objects: {id: Object}, clients: Set<WebSocket> }
+// roomId -> { objects: {id: Object}, deleted: Set<id>, clients: Set<WebSocket> }
 const rooms = new Map();
 
 function getRoom(id) {
-  if (!rooms.has(id)) rooms.set(id, { objects: {}, clients: new Set() });
+  if (!rooms.has(id)) {
+    rooms.set(id, { objects: {}, deleted: new Set(), clients: new Set() });
+  }
   return rooms.get(id);
 }
 
@@ -50,7 +61,6 @@ function leave(ws) {
   if (room) {
     room.clients.delete(ws);
     // Empty rooms are dropped, so state doesn't survive everyone leaving.
-    // (Persistence is a possible later step.)
     if (room.clients.size === 0) rooms.delete(ws.roomId);
   }
   ws.roomId = null;
@@ -70,7 +80,6 @@ wss.on("connection", (ws) => {
       const room = getRoom(msg.roomId);
       room.clients.add(ws);
       ws.roomId = msg.roomId;
-      // Full snapshot for the joiner.
       ws.send(JSON.stringify({ type: "sync", state: { roomId: msg.roomId, objects: room.objects } }));
       return;
     }
@@ -80,12 +89,25 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "edit") {
       const o = msg.object;
-      if (!o || typeof o.id !== "string") return;
-      room.objects[o.id] = o; // naive: last message wins. Step 4 replaces this.
+      if (!o || typeof o.id !== "string" || !Number.isFinite(o.version)) return;
+      if (room.deleted.has(o.id)) {
+        ws.send(JSON.stringify({ type: "delete", id: o.id })); // tell the sender it's gone
+        return;
+      }
+      const cur = room.objects[o.id];
+      if (CHECK && cur && !newer(o, cur)) {
+        // Lost the race: send the sender the authoritative copy.
+        if (JSON.stringify(cur) !== JSON.stringify(o)) {
+          ws.send(JSON.stringify({ type: "edit", object: cur }));
+        }
+        return;
+      }
+      room.objects[o.id] = o;
       broadcast(room, { type: "edit", object: o }, ws);
     } else if (msg.type === "delete") {
       if (typeof msg.id !== "string") return;
       delete room.objects[msg.id];
+      room.deleted.add(msg.id);
       broadcast(room, { type: "delete", id: msg.id }, ws);
     }
   });

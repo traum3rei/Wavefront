@@ -8,6 +8,9 @@
   const proto = location.protocol === "https:" ? "wss" : "ws";
   let ws = null;
 
+  const newer = (a, b) =>
+  a.version > b.version || (a.version === b.version && a.updatedBy > b.updatedBy);
+
   const dot = document.createElement("div");
   dot.style.cssText = "position:fixed;right:12px;bottom:10px;font:11px ui-monospace,monospace;color:#8a8d97";
   document.body.appendChild(dot);
@@ -17,6 +20,7 @@
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
   }
 
+  const deleted = new Set();
   function connect() {
     setStatus("connecting");
     ws = new WebSocket(`${proto}://${location.host}`);
@@ -27,10 +31,16 @@
       if (msg.type === "sync") {
         objects = msg.state.objects; // full snapshot replaces local state
       } else if (msg.type === "edit") {
-        objects[msg.object.id] = msg.object;
-      } else if (msg.type === "delete") {
-        delete objects[msg.id];
-      } else { return; }
+  const id = msg.object.id;
+  if (deleted.has(id)) return;
+  if (dragging && dragging.id === id) return; // don't fight the user's own drag
+  const cur = objects[id];
+  if (cur && !newer(msg.object, cur)) return; // we already hold a newer version
+  objects[id] = msg.object;
+} else if (msg.type === "delete") {
+  deleted.add(msg.id);
+  delete objects[msg.id];
+} else { return; }
       if (selectedId && !objects[selectedId]) selectedId = null;
       render();
     };
@@ -52,6 +62,7 @@
   const origDelete = deleteObject;
   deleteObject = function (id) {
     origDelete(id);
+    deleted.add(id)
     send({ type: "delete", id });
   };
 
